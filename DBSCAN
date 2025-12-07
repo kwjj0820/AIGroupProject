@@ -1,0 +1,215 @@
+import pandas as pd
+import numpy as np
+
+from google.colab import drive
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+from sklearn.neighbors import NearestNeighbors
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import folium
+
+drive.mount('/content/drive')
+
+file_path = "/content/drive/MyDrive/인공지능 조별과제/서울시_전동킥보드_견인현황_좌표_결측치제거(21.7~25.6).xlsx"
+df_db = pd.read_excel(file_path)
+
+LON_COL = "lng"
+LAT_COL = "lat"
+GU_COL  = "구정보"
+
+df_db = df_db.dropna(subset=[LON_COL, LAT_COL])
+
+print("전체 데이터 행 수(DBSCAN):", len(df_db))
+
+#============ 서울시 DBSCAN ==============
+X_db_seoul = df_db[[LON_COL, LAT_COL]].to_numpy()
+
+scaler_all_db = StandardScaler()
+X_db_seoul_scaled = scaler_all_db.fit_transform(X_db_seoul)
+
+# k-distance plot -> eps
+k_neighbors_db_seoul = 5
+nbrs_db_seoul = NearestNeighbors(n_neighbors=k_neighbors_db_seoul)
+nbrs_db_seoul.fit(X_db_seoul_scaled)
+distances_db_seoul, indices_db_seoul = nbrs_db_seoul.kneighbors(X_db_seoul_scaled)
+
+k_dist_db_seoul = np.sort(distances_db_seoul[:, k_neighbors_db_seoul - 1])
+
+plt.figure(figsize=(6, 4))
+plt.plot(k_dist_db_seoul)
+plt.xlabel("정렬된 포인트 인덱스")
+plt.ylabel(f"{k_neighbors_db_seoul}번째 이웃까지 거리")
+plt.title("서울 전체 DBSCAN eps k-distance plot")
+plt.grid(True)
+plt.show()
+
+
+# eps test
+for eps_val in [0.006, 0.008, 0.010, 0.012]:
+    for ms in [15, 20, 30]:
+        db_model = DBSCAN(eps=eps_val, min_samples=ms)
+        labs_test = db_model.fit_predict(X_db_seoul_scaled)
+        n_clusters = len(set(labs_test) - {-1})
+        n_noise = np.sum(labs_test == -1)
+        print(f"[서울 DBSCAN] eps={eps_val:.3f}, min_samples={ms}: "
+              f"클러스터={n_clusters}, 노이즈비율={n_noise/len(labs_test):.2%}")
+
+eps_seoul_db = 0.010
+min_samples_seoul_db = 30
+
+# DBSCAN 시각화
+dbscan_seoul = DBSCAN(eps=eps_seoul_db, min_samples=min_samples_seoul_db)
+labels_seoul_db = dbscan_seoul.fit_predict(X_db_seoul_scaled)
+
+df_db["dbscan_label_seoul"] = labels_seoul_db
+
+n_clusters_seoul_db = len(set(labels_seoul_db) - {-1})
+n_noise_seoul_db = np.sum(labels_seoul_db == -1)
+print("\n[서울 전체 DBSCAN 최종 요약]")
+print(f"eps={eps_seoul_db}, min_samples={min_samples_seoul_db}")
+print(f"클러스터 수 (노이즈 제외): {n_clusters_seoul_db}")
+print(f"노이즈 포인트 수: {n_noise_seoul_db} / {len(df_db)} "
+      f"({n_noise_seoul_db/len(df_db):.2%})")
+
+# Folium 지도
+center_seoul_db = [df_db[LAT_COL].mean(), df_db[LON_COL].mean()]
+m_seoul_db = folium.Map(location=center_seoul_db, zoom_start=12)
+
+unique_labels_seoul_db = sorted(set(labels_seoul_db))
+cluster_labels_seoul_db = [lab for lab in unique_labels_seoul_db if lab != -1]
+
+colors_seoul_db = mpl.cm.tab10(np.linspace(0, 1, max(1, len(cluster_labels_seoul_db))))
+colors_seoul_db = [mpl.colors.to_hex(c) for c in colors_seoul_db]
+
+max_points_per_cluster = 2000
+
+# 1) 클러스터 포인트
+for idx, lab in enumerate(cluster_labels_seoul_db):
+    sub = df_db[df_db["dbscan_label_seoul"] == lab]
+    if len(sub) > max_points_per_cluster:
+        sub = sub.sample(max_points_per_cluster, random_state=42)
+
+    for _, row in sub.iterrows():
+        folium.CircleMarker(
+            location=[row[LAT_COL], row[LON_COL]],
+            radius=2,
+            color=colors_seoul_db[idx],
+            fill=True,
+            fill_opacity=0.6,
+            weight=0,
+        ).add_to(m_seoul_db)
+
+# 2) 노이즈 포인트 (-1)
+noise_seoul_db = df_db[df_db["dbscan_label_seoul"] == -1]
+for _, row in noise_seoul_db.iterrows():
+    folium.CircleMarker(
+        location=[row[LAT_COL], row[LON_COL]],
+        radius=1,
+        color="#aaaaaa",
+        fill=True,
+        fill_opacity=0.4,
+        weight=0,
+    ).add_to(m_seoul_db)
+
+m_seoul_db
+
+
+#============ 송파구 DBSCAN ==============
+df_songpa_db = df_db[df_db[GU_COL] == "송파구"].copy()
+df_songpa_db = df_songpa_db.dropna(subset=[LON_COL, LAT_COL])
+
+print("\n송파구 데이터 행 수(DBSCAN):", len(df_songpa_db))
+
+X_db_songpa = df_songpa_db[[LON_COL, LAT_COL]].to_numpy()
+
+scaler_sp_db = StandardScaler()
+X_db_songpa_scaled = scaler_sp_db.fit_transform(X_db_songpa)
+
+# k-distance plot -> eps
+k_neighbors_db_songpa = 5
+nbrs_db_songpa = NearestNeighbors(n_neighbors=k_neighbors_db_songpa)
+nbrs_db_songpa.fit(X_db_songpa_scaled)
+distances_db_songpa, indices_db_songpa = nbrs_db_songpa.kneighbors(X_db_songpa_scaled)
+
+k_dist_db_songpa = np.sort(distances_db_songpa[:, k_neighbors_db_songpa - 1])
+
+plt.figure(figsize=(6, 4))
+plt.plot(k_dist_db_songpa)
+plt.xlabel("정렬된 포인트 인덱스")
+plt.ylabel(f"{k_neighbors_db_songpa}번째 이웃까지 거리")
+plt.title("송파구 DBSCAN eps 선택용 k-distance plot")
+plt.grid(True)
+plt.show()
+
+
+# eps test
+for eps_val in [0.006, 0.008, 0.010, 0.012]:
+    for ms in [15, 20, 30]:
+        db_model_sp = DBSCAN(eps=eps_val, min_samples=ms)
+        labs_sp_test = db_model_sp.fit_predict(X_db_songpa_scaled)
+        n_clusters = len(set(labs_sp_test) - {-1})
+        n_noise = np.sum(labs_sp_test == -1)
+        print(f"[송파구 DBSCAN] eps={eps_val:.3f}, min_samples={ms}: "
+              f"클러스터={n_clusters}, 노이즈비율={n_noise/len(labs_sp_test):.2%}")
+
+
+eps_songpa_db = 0.012
+min_samples_songpa_db = 15
+
+
+# DBSCAN 시각화
+dbscan_songpa = DBSCAN(eps=eps_songpa_db, min_samples=min_samples_songpa_db)
+labels_songpa_db = dbscan_songpa.fit_predict(X_db_songpa_scaled)
+
+df_songpa_db["dbscan_label_songpa"] = labels_songpa_db
+
+n_clusters_songpa_db = len(set(labels_songpa_db) - {-1})
+n_noise_songpa_db = np.sum(labels_songpa_db == -1)
+print("\n[최종 송파구 DBSCAN 요약]")
+print(f"eps={eps_songpa_db}, min_samples={min_samples_songpa_db}")
+print(f"클러스터 수 (노이즈 제외): {n_clusters_songpa_db}")
+print(f"노이즈 포인트 수: {n_noise_songpa_db} / {len(df_songpa_db)} "
+      f"({n_noise_songpa_db/len(df_songpa_db):.2%})")
+
+# Folium 지도
+center_songpa_db = [df_songpa_db[LAT_COL].mean(), df_songpa_db[LON_COL].mean()]
+m_songpa_db = folium.Map(location=center_songpa_db, zoom_start=13)
+
+unique_labels_songpa_db = sorted(set(labels_songpa_db))
+cluster_labels_songpa_db = [lab for lab in unique_labels_songpa_db if lab != -1]
+
+cluster_colors_songpa_db = mpl.cm.tab10(np.linspace(0, 1, max(1, len(cluster_labels_songpa_db))))
+cluster_colors_songpa_db = [mpl.colors.to_hex(c) for c in cluster_colors_songpa_db]
+
+max_points_per_cluster = 1500
+
+# 1) 클러스터 포인트
+for lab, col in zip(cluster_labels_songpa_db, cluster_colors_songpa_db):
+    sub = df_songpa_db[df_songpa_db["dbscan_label_songpa"] == lab]
+    if len(sub) > max_points_per_cluster:
+        sub = sub.sample(max_points_per_cluster, random_state=42)
+    for _, row in sub.iterrows():
+        folium.CircleMarker(
+            location=[row[LAT_COL], row[LON_COL]],
+            radius=5,
+            color=col,
+            fill=True,
+            fill_opacity=0.6,
+            weight=0,
+        ).add_to(m_songpa_db)
+
+# 2) 노이즈 포인트 (-1)
+noise_songpa_db = df_songpa_db[df_songpa_db["dbscan_label_songpa"] == -1]
+for _, row in noise_songpa_db.iterrows():
+    folium.CircleMarker(
+        location=[row[LAT_COL], row[LON_COL]],
+        radius=1,
+        color="#999999",
+        fill=True,
+        fill_opacity=0.4,
+        weight=0,
+    ).add_to(m_songpa_db)
+
+m_songpa_db
