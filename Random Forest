@@ -1,0 +1,382 @@
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import osmnx as ox
+import h3
+import optuna
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.neighbors import BallTree
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import os
+from tqdm import tqdm
+import warnings
+
+# 설정
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+try:
+    plt.rcParams['font.family'] = 'Malgun Gothic'
+except:
+    plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# 💡 예측값과 실제값 비교 시각화 함수 
+def plot_actual_vs_predicted(y_test, pred_log, mae):
+    """
+    실제값(y_test)과 예측값(pred_log)을 비교하고 잔차를 분석하는 그래프를 생성합니다.
+    (로그 스케일 해제하여 실제 개수 기반으로 시각화)
+    """
+    # 로그 변환 해제 (np.expm1 사용)
+    y_real = np.expm1(y_test)
+    # 예측값이 0보다 작은 경우를 방지 (로그 변환의 역변환이므로)
+    pred_real = np.expm1(np.maximum(0, pred_log)) 
+
+    residuals = pred_real - y_real 
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    plt.suptitle("Model Evaluation: Actual vs. Predicted & Residual Analysis", fontsize=18)
+
+    # 1. 실제값 vs 예측값 
+    axes[0].scatter(y_real, pred_real, alpha=0.6, color='#5DADE2', edgecolors='w', linewidths=0.5)
+
+    # 완벽한 예측선
+    max_val = max(y_real.max(), pred_real.max())
+    min_val = min(y_real.min(), pred_real.min())
+    axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect Prediction (y=x)')
+
+    axes[0].set_title(f"1. Actual vs. Predicted Towing Count (MAE: {mae:.2f})", fontsize=15)
+    axes[0].set_xlabel("Actual Towing Count ", fontsize=13)
+    axes[0].set_ylabel("Predicted Towing Count ", fontsize=13)
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+    axes[0].legend()
+
+    # 2. 잔차 플롯 (Residual Plot) 
+    axes[1].scatter(y_real, residuals, alpha=0.6, color='#A569BD', edgecolors='w', linewidths=0.5)
+    axes[1].axhline(y=0, color='r', linestyle='--', linewidth=2) # 잔차가 0인 기준선
+    
+    axes[1].set_title("2. Residual Plot", fontsize=15)
+    axes[1].set_xlabel("Actual Towing Count", fontsize=13)
+    axes[1].set_ylabel("Residuals (Predicted - Actual)", fontsize=13)
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+
+class TowingHotspotPredictor:
+    """
+    Random Forest와 Optuna를 이용한 전동 킥보드 견인 핫스팟 예측 파이프라인.
+    """
+    def __init__(self, data_path, resolution=10, cache_folder='cache'):
+        self.data_path = data_path
+        self.resolution = resolution
+        self.cache_folder = cache_folder
+        os.makedirs(self.cache_folder, exist_ok=True)
+        self.poi_data = {}
+        self.features = []
+        self.df_modeling = pd.DataFrame()
+        self.target_log = pd.Series(dtype=float)
+        self.best_model = None
+        self.raw_data = None
+        self.road_graph = None
+        self.road_edges_gdf = gpd.GeoDataFrame()
+        self.X_train = pd.DataFrame()
+        self.y_train = pd.Series(dtype=float)
+        self.feature_importance_series = pd.Series(dtype=float)
+
+    def load_data(self):
+        """[1단계] 데이터 로딩 및 이상치(강남구) 제거."""
+        print(f"🔹 [1단계] 견인 원본 데이터 로드...")
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"파일 경로를 찾을 수 없습니다: {self.data_path}")
+
+        df_loaded = None
+
+        try:
+            df_loaded = pd.read_excel(self.data_path)
+            print(f"    -> ✅ 데이터 로드 성공 (pd.read_excel 사용)")
+        except Exception:
+            try:
+                df_loaded = pd.read_csv(self.data_path, encoding='cp949')
+                print(f"    -> ✅ 데이터 로드 성공 (pd.read_csv, 인코딩: cp949로 대체)")
+            except UnicodeDecodeError:
+                try:
+                    df_loaded = pd.read_csv(self.data_path, encoding='cp949', errors='replace')
+                    print(f"    -> ⚠️ 데이터 로드 성공 (cp949 + errors='replace'로 오류 문자 대체 및 강제 로드)")
+                except Exception as e_final:
+                    raise Exception(f"파일 로드 최종 실패 (Excel/CSV 오류): {e_final}")
+
+        if df_loaded is None:
+            raise Exception("파일 로드에 실패했습니다. 유효한 데이터프레임을 생성할 수 없습니다.")
+
+        self.raw_data = df_loaded
+
+        self.raw_data = self.raw_data.dropna(subset=['lat', 'lng'])
+        self.raw_data['lat'] = pd.to_numeric(self.raw_data['lat'])
+        self.raw_data['lng'] = pd.to_numeric(self.raw_data['lng'])
+
+        if '구정보' in self.raw_data.columns:
+            org_len = len(self.raw_data)
+            self.raw_data = self.raw_data[self.raw_data['구정보'] != '강남구']
+            print(f"    -> 강남구 데이터 제외 완료 ({org_len:,d} -> {len(self.raw_data):,d}건)")
+        else:
+            print("    -> '구정보' 컬럼이 없어 강남구 제외 단계를 건너뜁니다.")
+
+
+    def load_environmental_data(self):
+        """[2단계] 환경 데이터(POI, 도로망) 로드/다운로드."""
+        print("🔹 [2단계] 주변 환경 데이터(POI) 및 도로망 로드...")
+
+        poi_tags = {
+            'subway': {'railway': 'station', 'station': 'subway'},
+            'bus': {'highway': 'bus_stop'},
+            'school': {'amenity': 'school'},
+            'crosswalk': {'highway': 'crossing'},
+            'cafe': {'amenity': 'cafe'}
+        }
+
+        def fetch_poi(name, tag):
+            cache_file = os.path.join(self.cache_folder, f"seoul_{name}.geojson")
+            if os.path.exists(cache_file):
+                try: return gpd.read_file(cache_file)
+                except Exception: pass
+
+            try:
+                gdf = ox.features_from_place("Seoul, South Korea", tags=tag)
+                if gdf.empty or 'geometry' not in gdf.columns: return gpd.GeoDataFrame(geometry=[])
+
+                gdf = gdf[gdf.geometry.type.isin(['Point', 'LineString', 'MultiPoint', 'Polygon'])]
+                if not gdf.empty:
+                    gdf['geometry'] = gdf.geometry.apply(lambda g: g.centroid if g.geom_type != 'Point' else g)
+                    gdf = gdf[['geometry']].copy()
+                    gdf.to_file(cache_file, driver='GeoJSON', encoding='utf-8')
+                return gdf
+            except Exception:
+                return gpd.GeoDataFrame(geometry=[])
+
+        for name, tag in poi_tags.items():
+            self.poi_data[name] = fetch_poi(name, tag)
+
+        road_file = os.path.join(self.cache_folder, 'seoul_roads_drive.graphml')
+        if os.path.exists(road_file):
+            self.road_graph = ox.load_graphml(road_file)
+        else:
+            print("    -> ⚠️ 도로망 다운로드 중 (시간 소요)...")
+            try:
+                self.road_graph = ox.graph_from_place("Seoul, South Korea", network_type='drive')
+                ox.save_graphml(self.road_graph, road_file)
+            except Exception:
+                self.road_graph = None
+
+        if self.road_graph:
+            self.road_edges_gdf = ox.graph_to_gdfs(self.road_graph, nodes=False, edges=True)
+        else:
+            self.road_edges_gdf = gpd.GeoDataFrame()
+
+
+    def create_features(self):
+        """[3단계] H3 격자 기반의 공간 특징(Feature) 공학."""
+        print(f"🔹 [3단계] H3 격자 매핑 및 복합 특징 생성 (res={self.resolution})...")
+
+        if self.raw_data is None or self.raw_data.empty:
+            raise Exception("데이터가 비어있습니다. 이전 단계를 확인하세요.")
+
+        self.raw_data['h3'] = self.raw_data.apply(
+            lambda x: h3.latlng_to_cell(x['lat'], x['lng'], self.resolution),
+            axis=1
+        )
+
+        target_df = self.raw_data['h3'].value_counts().reset_index()
+        target_df.columns = ['h3', 'count']
+        target_df['y_log'] = np.log1p(target_df['count'])
+        hex_list = target_df['h3'].tolist()
+
+        def calculate_road_density(hex_list, edges, res):
+            if edges.empty: return [0.0] * len(hex_list)
+
+            edges['h3'] = edges.geometry.centroid.apply(lambda g: h3.latlng_to_cell(g.y, g.x, res))
+            if 'length' in edges.columns:
+                length_by_hex = edges.groupby('h3')['length'].sum().to_dict()
+            else:
+                try: length_by_hex = edges.geometry.length.groupby(edges['h3']).sum().to_dict()
+                except Exception: return [0.0] * len(hex_list)
+            return [length_by_hex.get(h, 0.0) for h in hex_list]
+
+        def calculate_nearest_distance(hex_list, target_gdf):
+            if target_gdf.empty or len(target_gdf) == 0: return [999999.0] * len(hex_list)
+            coords = [h3.cell_to_latlng(h) for h in hex_list]
+            src = np.radians(np.array(coords))
+            point_geoms = target_gdf.geometry[target_gdf.geometry.type == 'Point']
+            if point_geoms.empty: return [999999.0] * len(hex_list)
+            tgt = np.radians(np.array([(p.y, p.x) for p in point_geoms]))
+            tree = BallTree(tgt, metric='haversine')
+            dists, _ = tree.query(src, k=1)
+            return (dists.flatten() * 6371000).tolist() 
+
+        def calculate_poi_influence(hex_list, target_gdf, res, decay=0.5):
+            if target_gdf.empty or len(target_gdf) == 0: return [0.0] * len(hex_list)
+            p_h3 = [h3.latlng_to_cell(geom.y, geom.x, res) for geom in target_gdf.geometry if geom.geom_type == 'Point']
+            if not p_h3: return [0.0] * len(hex_list)
+            p_cnt = pd.Series(p_h3).value_counts().to_dict()
+            res_list = []
+            for h in hex_list:
+                s = 0.0
+                for n in h3.grid_disk(h, 1): 
+                    c = p_cnt.get(n, 0)
+                    if c > 0: s += c * (1.0 if n == h else decay)
+                res_list.append(float(s))
+            return res_list
+
+        data = {
+            'road_density': calculate_road_density(hex_list, self.road_edges_gdf, self.resolution),
+            'dist_subway': calculate_nearest_distance(hex_list, self.poi_data['subway']),
+            'dist_school': calculate_nearest_distance(hex_list, self.poi_data['school']),
+            'dist_cross': calculate_nearest_distance(hex_list, self.poi_data['crosswalk']),
+            'imp_cafe': calculate_poi_influence(hex_list, self.poi_data['cafe'], self.resolution, 0.5),
+            'imp_bus': calculate_poi_influence(hex_list, self.poi_data['bus'], self.resolution, 0.3)
+        }
+
+        self.df_modeling = pd.DataFrame(data)
+        self.target_log = target_df['y_log']
+        self.features = list(data.keys())
+        print("    -> 피처 생성 완료:", self.features)
+
+
+    def train_and_optimize(self, trials=10):
+        """[4단계] Optuna 기반 Random Forest 모델 최적화 및 학습"""
+        print(f"\n🔹 [4단계] Optuna 최적화 및 Random Forest 학습 (시도 횟수: {trials})...")
+
+        if self.df_modeling.empty:
+            raise Exception("모델 학습 데이터가 비어있습니다.")
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            self.df_modeling, self.target_log, test_size=0.2, random_state=42
+        )
+        self.X_train = X_train
+        self.y_train = y_train
+
+        def objective(trial):
+            param = {
+                'n_estimators': trial.suggest_int('n_estimators', 50, 300),
+                'max_depth': trial.suggest_int('max_depth', 5, 20),
+                'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+                'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 10),
+                'max_features': trial.suggest_float('max_features', 0.6, 1.0),
+                'n_jobs': -1,
+                'random_state': 42
+            }
+            model = RandomForestRegressor(**param)
+            kf = KFold(n_splits=3, shuffle=True, random_state=42)
+            # 교차 검증
+            scores = [r2_score(y_train.iloc[val], model.fit(X_train.iloc[tr], y_train.iloc[tr]).predict(X_train.iloc[val]))
+                      for tr, val in kf.split(X_train, y_train)]
+            return np.mean(scores)
+
+        # Optuna
+        try:
+            study = optuna.create_study(direction='maximize')
+            study.optimize(objective, n_trials=trials, show_progress_bar=True)
+            print(f"    🔎 찾은 최적 파라미터: {study.best_params}")
+            best_params = study.best_params
+        except Exception as e:
+            print(f"Optuna 실행 오류 발생 ({e}). 기본 파라미터로 대체합니다.")
+            best_params = {
+                'n_estimators': 100,
+                'max_depth': 10,
+                'min_samples_split': 10,
+                'min_samples_leaf': 5,
+                'max_features': 1.0
+            }
+
+
+        self.best_model = RandomForestRegressor(
+            **best_params, n_jobs=-1, random_state=42
+        )
+        self.best_model.fit(X_train, y_train)
+
+        r2 = self.best_model.score(X_test, y_test)
+        pred_log = self.best_model.predict(X_test)
+
+        pred_real = np.expm1(np.maximum(0, pred_log))
+        y_real = np.expm1(y_test)
+        mae = mean_absolute_error(y_real, pred_real)
+
+        print("\n" + "="*50)
+        print(f"🏆 최종 모델 확정 성적표 (모델: RandomForest, R={self.resolution})")
+        print(f"✅ R2 Score (테스트): {r2:.4f}")
+        print(f"✅ MAE (평균 오차): {mae:.2f}건")
+        print("="*50)
+
+        r2_train = self.best_model.score(X_train, y_train)
+        r2_test = r2
+        r2_diff = r2_train - r2_test
+
+        if r2_train > 0:
+            overfit_ratio = (r2_diff / r2_train) * 100
+        else:
+            overfit_ratio = 100.0
+
+        print("\n--- 모델 적합도 진단 ---")
+        print(f"R2 훈련 성능 (Training): {r2_train:.4f}")
+        print(f"R2 테스트 성능 (Testing): {r2_test:.4f}")
+        print(f"R2 차이 (Gap): {r2_diff:.4f}")
+        print(f"⚠️ 과적합 비율 (% 손실): {overfit_ratio:.2f}%")
+
+        if r2_diff > 0.05:
+            fit_status = "⚠️ Overfitting (과적합) 경향"
+        elif r2_test < 0.2:
+            fit_status = "❌ Poor Fit / Underfit (패턴을 충분히 학습하지 못함)"
+        else:
+            fit_status = "✅ Good Fit (적절한 일반화)"
+
+        print(f"적합도 판정: {fit_status}")
+        print("--------------------")
+
+        plot_actual_vs_predicted(y_test, pred_log, mae)
+
+        imp = pd.Series(
+            self.best_model.feature_importances_,
+            index=self.features
+        ).sort_values(ascending=False)
+        self.feature_importance_series = imp
+        print("\n🔍 변수 중요도 (Feature Importance):\n", imp.to_string())
+
+        return self.best_model
+
+
+def plot_results(model_instance):
+    """결과 시각화 (변수 중요도 막대 그래프)"""
+    plt.figure(figsize=(10, 6))
+    model_instance.feature_importance_series.plot(kind='barh', color='skyblue')
+    plt.title('Feature Importance', fontsize=15)
+    plt.xlabel('Importance Score', fontsize=12)
+    plt.ylabel('Feature', fontsize=12)
+    plt.gca().invert_yaxis()
+    plt.show()
+    pass
+
+
+if __name__ == "__main__":
+    data_file = '서울시_전동킥보드_견인현황_좌표_결측치제거(21.7~25.6).xlsx'
+
+    try:
+        pipeline = TowingHotspotPredictor(data_file)
+
+        print("----------------------------------------------------")
+        print("             Towing Hotspot 예측 모델 실행 시작             ")
+        print("----------------------------------------------------")
+
+        pipeline.load_data()
+        pipeline.load_environmental_data()
+        pipeline.create_features()
+        best_model = pipeline.train_and_optimize(trials=10) 
+
+        plot_results(pipeline)
+
+    except FileNotFoundError as e:
+        print(f"\n❌ 분석 실행 실패: 파일을 찾을 수 없습니다. 파일 경로를 확인하세요. {e}")
+    except Exception as e:
+        print(f"\n❌ 분석 실행 중 치명적인 오류 발생: {e}")
