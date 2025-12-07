@@ -1,0 +1,204 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_samples, silhouette_score
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib import cm
+
+import folium
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+file_path = "/content/drive/MyDrive/인공지능 조별과제/서울시_전동킥보드_견인현황_좌표_결측치제거(21.7~25.6).xlsx"
+df_km = pd.read_excel(file_path)
+
+LON_COL = "lng"
+LAT_COL = "lat"
+GU_COL  = "구정보"
+
+df_km = df_km.dropna(subset=[LON_COL, LAT_COL])
+
+X_km_seoul = df_km[[LON_COL, LAT_COL]].to_numpy()
+
+#=============== 서울시 K-means ==================
+# elbow plot(Inertia)
+k_list_km_seoul = range(2, 16)
+inertias_km_seoul = []
+
+for k in k_list_km_seoul:
+    km_model = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    km_model.fit(X_km_seoul)
+    inertias_km_seoul.append(km_model.inertia_)
+
+plt.figure(figsize=(6, 4))
+plt.plot(k_list_km_seoul, inertias_km_seoul, marker='o')
+plt.xlabel("클러스터 개수 k")
+plt.ylabel("Inertia")
+plt.title("서울시 전체 K-means 엘보우 플롯")
+plt.grid(True)
+plt.show()
+
+
+# 서울시 K-means 시각화(지도)
+k_opt_seoul_km = 8
+
+kmeans_seoul = KMeans(n_clusters=k_opt_seoul_km, random_state=42, n_init="auto")
+df_km["kmeans_label_seoul"] = kmeans_seoul.fit_predict(X_km_seoul)
+centers_seoul_km = kmeans_seoul.cluster_centers_   # (lng, lat)
+
+center_seoul = [df_km[LAT_COL].mean(), df_km[LON_COL].mean()]
+m_seoul_km = folium.Map(location=center_seoul, zoom_start=12)
+
+colors_seoul_km = mpl.cm.tab10(np.linspace(0, 1, k_opt_seoul_km))
+colors_seoul_km = [mpl.colors.to_hex(c) for c in colors_seoul_km]
+
+max_points_per_cluster = 2000
+
+for lab in range(k_opt_seoul_km):
+    sub = df_km[df_km["kmeans_label_seoul"] == lab]
+    if len(sub) > max_points_per_cluster:
+        sub = sub.sample(max_points_per_cluster, random_state=42)
+
+    for _, row in sub.iterrows():
+        folium.CircleMarker(
+            location=[row[LAT_COL], row[LON_COL]],
+            radius=2,
+            color=colors_seoul_km[lab],
+            fill=True,
+            fill_opacity=0.5,
+            weight=0,
+        ).add_to(m_seoul_km)
+
+for i, (lng, lat) in enumerate(centers_seoul_km):
+    folium.Marker(
+        location=[lat, lng],
+        tooltip=f"[서울 K-means] Cluster {i} 중심",
+        icon=folium.Icon(color="black", icon="info-sign")
+    ).add_to(m_seoul_km)
+
+m_seoul_km
+
+
+#=============== 송파구 K-means ==================
+# elbow plot(Inertia)
+df_songpa_km = df_km[df_km[GU_COL] == "송파구"].copy()
+df_songpa_km = df_songpa_km.dropna(subset=[LON_COL, LAT_COL])
+X_km_songpa = df_songpa_km[[LON_COL, LAT_COL]].to_numpy()
+
+print("전체 데이터 개수 :", len(df_km))
+print("송파구 데이터 개수(K-means):", len(df_songpa_km))
+
+k_list_km_songpa = range(2, 16)
+inertias_km_songpa = []
+
+for k in k_list_km_songpa:
+    km_model_sp = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    km_model_sp.fit(X_km_songpa)
+    inertias_km_songpa.append(km_model_sp.inertia_)
+
+plt.figure(figsize=(7, 5))
+plt.plot(k_list_km_songpa, inertias_km_songpa, marker='o')
+plt.xlabel("클러스터 개수 k")
+plt.ylabel("Inertia")
+plt.title("송파구 K-means elbow plot")
+plt.grid(True)
+plt.show()
+
+
+# silhouette score
+k_list_sil_km_songpa = [14, 15, 16, 17]
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+axes = axes.flatten()
+
+for idx, k in enumerate(k_list_sil_km_songpa):
+    ax = axes[idx]
+
+    kmeans_sp_tmp = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    cluster_labels_sp_tmp = kmeans_sp_tmp.fit_predict(X_km_songpa)
+
+    silhouette_avg = silhouette_score(X_km_songpa, cluster_labels_sp_tmp)
+    sample_silhouette_values = silhouette_samples(X_km_songpa, cluster_labels_sp_tmp)
+
+    ax.set_xlim([-0.1, 1])
+    ax.set_ylim([0, len(X_km_songpa) + (k + 1) * 10])
+
+    y_lower = 10
+    for i in range(k):
+        ith_vals = sample_silhouette_values[cluster_labels_sp_tmp == i]
+        ith_vals.sort()
+
+        size_i = ith_vals.shape[0]
+        y_upper = y_lower + size_i
+
+        color = cm.nipy_spectral(float(i) / k)
+        ax.fill_betweenx(
+            np.arange(y_lower, y_upper),
+            0,
+            ith_vals,
+            facecolor=color,
+            edgecolor=color,
+            alpha=0.7,
+        )
+
+        ax.text(-0.05, (y_lower + y_upper) / 2.0, str(i))
+        y_lower = y_upper + 10
+
+    ax.axvline(x=silhouette_avg, color="red", linestyle="--")
+    ax.set_title(f"k = {k}, avg = {silhouette_avg:.3f}")
+    ax.set_xlabel("Silhouette Coefficient")
+    ax.set_ylabel("Cluster")
+    ax.set_yticks([])
+
+for j in range(len(k_list_sil_km_songpa), len(axes)):
+    axes[j].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+# 송파구 K-means 시각화(지도)
+k_opt_songpa_km = 15
+
+kmeans_songpa = KMeans(n_clusters=k_opt_songpa_km, random_state=42, n_init="auto")
+df_songpa_km["kmeans_label_songpa"] = kmeans_songpa.fit_predict(X_km_songpa)
+centers_songpa_km = kmeans_songpa.cluster_centers_   # (lng, lat)
+
+print("송파구 클러스터별 건수(K-means):")
+print(df_songpa_km["kmeans_label_songpa"].value_counts().sort_index())
+
+center_songpa_km = [df_songpa_km[LAT_COL].mean(), df_songpa_km[LON_COL].mean()]
+m_songpa_km = folium.Map(location=center_songpa_km, zoom_start=13)
+
+colors_songpa_km = mpl.cm.tab10(np.linspace(0, 1, k_opt_songpa_km))
+colors_songpa_km = [mpl.colors.to_hex(c) for c in colors_songpa_km]
+
+max_points_per_cluster = 1500
+
+for lab in range(k_opt_songpa_km):
+    sub = df_songpa_km[df_songpa_km["kmeans_label_songpa"] == lab]
+    if len(sub) > max_points_per_cluster:
+        sub = sub.sample(max_points_per_cluster, random_state=42)
+
+    for _, row in sub.iterrows():
+        folium.CircleMarker(
+            location=[row[LAT_COL], row[LON_COL]],
+            radius=4,
+            color=colors_songpa_km[lab],
+            fill=True,
+            fill_opacity=0.8,
+            weight=0,
+        ).add_to(m_songpa_km)
+
+for i, (lng, lat) in enumerate(centers_songpa_km):
+    folium.Marker(
+        location=[lat, lng],
+        tooltip=f"[송파구 K-means] Cluster {i} 중심",
+        icon=folium.Icon(color="black", icon="info-sign")
+    ).add_to(m_songpa_km)
+
+m_songpa_km
